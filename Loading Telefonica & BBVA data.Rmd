@@ -1,0 +1,368 @@
+---
+title: "Untitled"
+author: "Blanca Alonso"
+date: "17 Feb 2015"
+output: html_document
+---
+
+```{r}
+require(maptools)
+library(fields)
+library(rgdal)
+library(ggplot2)
+library(ggmap)
+library(sp)
+library(sqldf)
+library(cluster)
+library(fpc)
+library(reshape)
+```
+
+Loading Telefonica grid: reading shp and getting fields
+```{r}
+WGS84=CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+map=readShapeSpatial(fn="Telefonica/MGrid_WKT_Bizkaia_WGS84/MGrid_WKT_Bizkaia_WGS84", proj4string=WGS84)
+map@data$field_1=as.numeric(as.character(map@data$field_1))
+cent=coordinates(map); 
+cd=data.frame(lat=cent[,2], lon=cent[,1], id=1:dim(cent)[1]); str(cd); head(cd)
+data_map=fortify(map)
+write.table(data_map, "d_map.txt", sep="\t")
+
+qmap('bilbao', zoom = 10) + geom_polygon(aes(x = long, y = lat, group = group), data = data_map, colour = 'white', fill = 'black', alpha = .5, size = .3) 
+```
+
+Identifying grid tiles with different dimensions: 
+```{r}
+cent=coordinates(map); 
+cd=data.frame(lat=cent[,2], lon=cent[,1], id=1:dim(cent)[1]); str(cd); head(cd)
+
+x=spTransform(map, CRS("+init=epsg:3631")) # getting areas
+area=sapply(slot(x, "polygons"), slot, "area")
+
+y=data.frame(l=round(sqrt(area))) # y: length of boxes
+aggregate(y, by=list(y$l), length)
+y$type[y$l>95&y$l<100]="a"
+y$type[y$l>195&y$l<200]="b"
+y$type[y$l>390&y$l<400]="c"
+y$type[y$l>785&y$l<790]="d"
+y$type[y$l>1574&y$l<1578]="e"
+y$type=as.factor(y$type); str(y); head(y)
+
+df=data.frame(tid=as.numeric(as.character(map$field_1)), clat=cent[,2], clon=cent[,1], area, ttype=y$type); str(df); head(df)
+```
+
+Incorporating density data:
+```{r}
+files=list.files("Telefonica/cleaned_mobile_data", full.names=T); files 
+
+d0=data.frame()
+for (i in 1:length(files)){ 
+  f=read.table(files[i], sep=",", header=F, stringsAsFactors=F)
+  d0=rbind(d0, f)
+  cat(files[i])
+  cat(dim(f))
+}; str(d0)
+check0=aggregate(d0, by=list(d0$V1), length); str(check0) #1243968
+d0$V5=paste(d0$V1, d0$V3, sep=" "); str(d0); head(d0)
+d0$V5=strptime(d0$V5, format="%Y-%m-%d %H"); str(d0); head(d0)
+#write.table(d0, "Telefonica/201401.txt", sep="\t")
+to_m=data.frame(tid=d0$V2, datetime=d0$V5, dens=d0$V4); str(to_m); head(to_m)
+
+# Merging dataframes
+d1=merge(x=df, y=to_m, by.x="tid", by.y="tid", all=T); str(d1); head(d1)
+sum(is.na(d1$area))
+#write.table(d1, "Telefonica/201401&shp.txt", sep="\t")
+```
+
+Incorporating density data:
+```{r}
+d1=read.table("Telefonica/201401&shp.txt", sep="\t"); str(d1); head(d1)
+```
+
+Normilizing density fields:
+```{r}
+d1$Ndens=as.numeric(NA); 
+str(d1); head(d1)
+d1[!is.na(d1$ttype) & d1$ttype=='a',]$Ndens=d1[!is.na(d1$ttype) & d1$ttype=='a',]$dens
+d1[!is.na(d1$ttype) & d1$ttype=='b',]$Ndens=d1[!is.na(d1$ttype) & d1$ttype=='b',]$dens/4
+d1[!is.na(d1$ttype) & d1$ttype=='c',]$Ndens=d1[!is.na(d1$ttype) & d1$ttype=='c',]$dens/16
+d1[!is.na(d1$ttype) & d1$ttype=='d',]$Ndens=d1[!is.na(d1$ttype) & d1$ttype=='d',]$dens/64
+d1[!is.na(d1$ttype) & d1$ttype=='e',]$Ndens=d1[!is.na(d1$ttype) & d1$ttype=='e',]$dens/256
+
+# Check:
+c=d1[!is.na(d1$ttype),]; str(c); head(c) #Checking missing values: 25,966,344
+c_=d1[is.na(d1$ttype),]; str(c_); head(c_) #Checking missing values: 12,596,664
+c0=aggregate(c, by=list(c$tid), length); str(c0); head(c0) # 34901 obs.
+c0_=aggregate(c_, by=list(c_$tid), length); str(c0_); head(c0_) # 16931 obs.
+
+c0$tid_=1:dim(c0)[1]; str(c0); head(c0) # 34901 obs.
+
+# Average hourly density per day (in January):
+dh=d1[!is.na(d1$Ndens),c(1,6,8)]; str(dh); head(dh) # 25966344 obs. # hourly data: data frame with densities by hour
+dh$datetime=strptime(dh$datetime, format="%Y-%m-%d %H")
+
+# Check to include it later/remove:
+dh$mday=dh$datetime$mday; str(dh); head(dh, 100)
+dh$hour=dh$datetime$hour; str(dh); head(dh, 100)
+```
+
+Including a second 'id' for Telefonica polygons:
+```{r}
+dh_=merge(x=dh, y=c0[, c(1, 10)], by.x='tid', by.y='Group.1', all.x=T); str(dh_); head(dh_) # 25,966,344 obs.
+#write.table(dh_, "dh_.txt", sep="\t")
+```
+
+Reading Telefonica processed data:
+```{r}
+dh_=read.table("dh_.txt", sep="\t"); str(dh_); head(dh_)
+```
+
+# Loading BBVA basic_stats transaction data
+```{r}
+files = list.files("BBVA", full.names=T); files 
+# [1] "BBVA/age_distribution000"         "BBVA/basic_stats000"             
+# [3] "BBVA/customer_zipcodes000"        "BBVA/demographic_distribution000"
+# [5] "BBVA/expenditure-time_curve000"   "BBVA/gender_distribution000"     
+# [7] "BBVA/payment_distribution000" 
+```
+
+```{r}
+t0=read.table(files[2], sep="\t", header=F, stringsAsFactors=F); str(t0); head(t0)
+colnames(t0)=c("lat", "lon", "date", "sector", "nm", "nc", "nt", "avgt", "maxt", "mint", "stdt")
+t0$date=strptime(t0$date, format="%Y-%m-%d")
+t0$sector=as.factor(t0$sector); str(t0); head(t0)
+```
+
+Printing all tiles from BBVA (gradient of tiles fill infer number of transactions):
+```{r}
+t=data.frame(lon=t0$lon, lat=t0$lat)
+
+# Offsetting:
+ox=0.406; oy=0; R=6371.009 
+t$lat0 = t$lat + (180/pi)*(oy/R)
+t$lon0 = t$lon + (180/pi)*(ox/R)/cos(t$lat0)
+
+ox=0.406; oy=-0.555; R=6371.009 
+t$lat1 = t$lat + (180/pi)*(oy/R)
+t$lon1 = t$lon + (180/pi)*(ox/R)/cos(t$lat1)
+
+ox=0; oy=-0.555; R=6371.009 
+t$lat2 = t$lat + (180/pi)*(oy/R)
+t$lon2 = t$lon + (180/pi)*(ox/R)/cos(t$lat2)
+
+l=list()
+for (i in 1:dim(t0)[1]){
+  pol_lat = c(t$lat[i], t$lat0[i], t$lat1[i], t$lat2[i], t$lat[i])
+  pol_lon = c(t$lon[i], t$lon0[i], t$lon1[i], t$lon2[i], t$lon[i])
+  c=matrix(c(pol_lon, pol_lat), ncol=2)
+  p=list(Polygon(c))
+  ps=Polygons(p, ID=i)
+  l=append(l,ps)
+}
+
+sp_poly=SpatialPolygons(l)
+proj4string(sp_poly)=WGS84
+sp_poly_df <- SpatialPolygonsDataFrame(sp_poly, data=data.frame(n=numeric(length(sp_poly))))
+#writeOGR(sp_poly_df, "chull", layer="chull", driver="ESRI Shapefile")
+
+data_p=fortify(sp_poly_df)
+qmap(location = c(lon = mean(data_p$long), lat = mean(data_p$lat)), zoom = 11)  + geom_polygon(aes(x=long, y=lat, group = group), data=data_map, colour='white', alpha=.3, size=.3) + geom_polygon(aes(x=long, y=lat, group = group), data=data_p, colour='red', fill='black', alpha=.1, size=.3)
+```
+
+# Overlapping (BBVA & Telefonica) tiles:
+
+Creating a matrix of unique polygons:
+```{r}
+t=data.frame(lon=t0$lon, lat=t0$lat)
+td_B=aggregate(t, by=list(t$lat, t$lon), length)[,1:2]; str(td_B); head(td_B)
+colnames(td_B)=c('lat', 'lon'); td_B$tid=1:dim(td_B)[1]; str(td_B); head(td_B) 
+
+t_=td_B
+ox=0.406; oy=0; R=6371.009 
+t_$lat0 = t_$lat + (180/pi)*(oy/R)
+t_$lon0 = t_$lon + (180/pi)*(ox/R)/cos(t_$lat0)
+
+ox=0.406; oy=-0.555; R=6371.009 
+t_$lat1 = t_$lat + (180/pi)*(oy/R)
+t_$lon1 = t_$lon + (180/pi)*(ox/R)/cos(t_$lat1)
+
+ox=0; oy=-0.555; R=6371.009 
+t_$lat2 = t_$lat + (180/pi)*(oy/R)
+t_$lon2 = t_$lon + (180/pi)*(ox/R)/cos(t_$lat2)
+
+l_=list()
+for (i in 1:dim(t_)[1]){
+  pol_lat = c(t_$lat[i], t_$lat0[i], t_$lat1[i], t_$lat2[i], t_$lat[i])
+  pol_lon = c(t_$lon[i], t_$lon0[i], t_$lon1[i], t_$lon2[i], t_$lon[i])
+  c=matrix(c(pol_lon, pol_lat), ncol=2)
+  p=list(Polygon(c))
+  ps=Polygons(p, ID=i)
+  l_=append(l_,ps)
+}; length(l_)
+
+ps_=SpatialPolygons(l_); proj4string(ps_)=WGS84
+psdf_=SpatialPolygonsDataFrame(ps_, data=data.frame(n=numeric(length(ps_))))
+d_p_=fortify(psdf_)
+
+dl=as.data.frame(cent); names(dl)=c('lon', 'lat')
+
+# Including (to td_B) tile centroids
+td_B$clat=coordinates(psdf_)[,2]
+td_B$clon=coordinates(psdf_)[,1]
+
+qmap(location=c(lon=mean(d_p_$long), lat=mean(d_p_$lat)), zoom = 12) + geom_polygon(aes(x=long, y=lat, group = group), data=data_map, colour='white', alpha=.3, size=.3) + geom_polygon(aes(x=long, y=lat, group=group), data=d_p_, colour='red', alpha=.1, size=.3) + geom_text(aes(label=tid, x=clon, y=clat), data=td_B, size=4)
+
+# Overlaping both grids
+cent_s=SpatialPoints(cent); proj4string(cent_s)=WGS84
+o=over(ps_, cent_s, returnList = TRUE); o; str(o)
+```
+
+```{r}
+write.table(td_B, "td_B.txt", sep="\t")
+write.table(t_, "t_.txt", sep="\t")
+write.table(d_p_, "d_p_.txt", sep="\t") # dataframe of polygons info
+```
+
+Labelling each Tef. tile to the BBVA tile they belong to: 
+```{r}
+# dd: (Telefonica) density data
+dd=dh_
+dd$tid_B=as.numeric(NA)
+for (i in 1:length(o)){
+  for (j in 1:length(o[[i]])){
+    dd$tid_B[dd$tid_==as.numeric(o[[i]][j])]=i
+    }
+}; str(dd); head(dd)
+
+write.table(dd, "dd.txt", sep="\t")
+```
+
+Reading Telefonica density data (dd) labeled by BBVA tid and BBVA tile geolocation info (td_B):
+```{r}
+dd=read.table("dd.txt", sep="\t"); str(dd); head(dd)
+td_B=read.table("td_B.txt", sep="\t"); str(td_B); head(td_B)
+```
+
+Creating a clean-of-NA dataframe with _densities per hour_ for each BBVA tile. 
+```{r}
+dd_c=dd[!is.na(dd$tid_B),] # dd (density data with BBVA tile associated) clean
+
+# dd_c_d: aggregated density data by BBVA tile by day (sum):
+dd_c_d=aggregate(Ndens~tid_B+as.character(datetime), data=dd_c, sum);
+names(dd_c_d)[2]='datetime'; str(dd_c_d); head(dd_c_d)
+dd_c_d$datetime=strptime(dd_c_d$datetime, format='%Y-%m-%d %H')
+write.table(dd_c_d, "dd_c_d.txt", sep="\t")
+```
+
+```{r}
+dd_c_d=read.table("dd_c_d.txt", sep="\t"); str(dd_c_d); head(dd_c_d)
+td_B=read.table("td_B.txt", sep="\t"); str(td_B); head(td_B)
+```
+
+Mobility function between BBVA tiles:
+```{r}
+# Require dd_c_d & td_B:
+
+mob_b_tiles=function(tid_o, tid_d){
+  #origin
+  clat_o=rep(td_B[td_B$tid==tid_o,]$clat, 744)
+  clon_o=rep(td_B[td_B$tid==tid_o,]$clon, 744)
+  datetime=dd_c_d$datetime[dd_c_d$tid_B==tid_o]
+  dens_o=dd_c_d$Ndens[dd_c_d$tid_B==tid_o]
+  d_o=data.frame(tid_o, clat_o, clon_o, dens_o, datetime)  
+  #destination
+  clat_d=rep(td_B[td_B$tid==tid_d,]$clat, 744)
+  clon_d=rep(td_B[td_B$tid==tid_d,]$clon, 744)
+  datetime=dd_c_d$datetime[dd_c_d$tid_B==tid_d]
+  dens_d=dd_c_d$Ndens[dd_c_d$tid_B==tid_d]
+  d_d=data.frame(tid_d, clat_d, clon_d, dens_d, datetime)  
+  
+  d=merge(x=d_o, y=d_d, by="datetime", all=T)
+  
+  for (i in 1:length(d)){
+    if (tid_o==tid_d) {d$dist[i]=0; d$np=d$dens_o} else {
+    d$dist[i]=rdist.earth(matrix(c(d$clon_o[i],d$clat_o[i]), ncol=2), matrix(c(d$clon_d[i],d$clat_d[i]), ncol=2), miles=FALSE, R=6371)
+    d$np=((d$dens_o*d$dens_d)^0.9)/(d$dist*1000^1.2)
+    }
+  }
+  return (d)
+}
+
+tid_o=12; tid_d=12
+head(mob_b_tiles(tid_o, tid_d)) 
+```
+
+# Calculating traffic index per tile:
+
+```{r}
+# Defining aggregation of tiles
+v1=c(1); v2=c(2); v3=c(3); v4=c(4); v5=c(5); v6=c(6); v7=c(7, 10); v8=c(8)
+v9=c(9, 14); v10=c(10, 7, 11); v11=c(11, 10); v12=c(12, 13); v13=c(13, 12)
+v14=c(14, 9); v15=c(15, 16); v16=c(16, 15, 17, 18); v17=c(17, 16); v18=c(18, 16); v19=c(19); v20=c(20); v21=c(21); v22=c(22); v23=c(23, 24, 25); v24=c(24, 23); v25=c(25, 23); v26=c(26, 30); v27=c(27, 32); v28=c(28, 29); v29=c(29, 30, 33, 28); v30=c(30, 26, 31, 34, 29); v31=c(31, 32, 35, 30); v32=c(32, 27, 36, 31); v33=c(33, 29, 34, 37); v34=c(34, 30, 35, 38, 33); v35=c(35, 31, 36, 39, 34); v36=c(36, 32, 35); v37=c(37, 33, 38, 41); v38=c(38, 34, 39, 42, 37); v39=c(39, 35, 38, 43); v40=c(40, 41); v41=c(41, 37, 42, 44, 40); v42=c(42, 38, 43, 45, 41); v43=c(43, 39, 42, 46); v44=c(44, 41, 45, 48); v45=c(45, 42, 46, 49, 44); v46=c(46, 43, 47, 45); v47=c(47, 46); v48=c(48, 44, 49, 51); v49=c(49, 45, 48); v50=c(50, 51, 52); v51=c(51, 48, 50, 53); v52=c(52, 50, 53); v53=c(53, 51, 52); v54=c(54); v55=c(55, 56); v56=c(56, 55); v57=c(57, 58); v58=c(58, 57); v59=c(59); v60=c(60); v61=c(61); v62=c(62); v63=c(63); v64=c(64); v65=c(65); v66=c(66); v67=c(67)
+```
+
+Traffic index (average hourly, per tile) matrix:
+```{r}
+# Vector with all groups of adjecent tiles:
+v=NULL
+for (i in 1:67){v=append(v, sprintf('v%s', i))}; v
+
+# Creating traffic index dataframe ('dti'): average hourly levels
+tid=c()  # tile id
+ti=c()   # traffic index per tile
+for (j in 1:length(v)){
+    tt=0
+    for (i in 1:length(get(v[j]))){
+      d=NULL; 
+      to=get(v[j])[1]; print(to)
+      td=get(v[j])[i]; print(td)
+      d=mob_b_tiles(to, td); t=round(mean(d$np), 2);
+      tt=tt+t
+    }
+    tid=append(tid, j[1])
+    ti=append(ti, tt)
+}
+dti=data.frame(tid, ti); dti # traffic index data
+qplot (dti$ti, geom="blank") + geom_histogram (colour=I("white"), aes(y=..density..)) + stat_function(fun=dnorm, aes(colour="Normal"), arg=list(mean=mean(dti$ti), sd=sd(dti$ti)))
+write.table(dti, "dti.txt", sep="\t")
+```
+
+# Loading zipcodes epicenters (external data): 
+
+Zipcodes boundaries should have been used (not available for free)
+```{r}
+zg=read.csv('european_postcodes_eu_standard.csv', sep=";", header=F, stringsAsFactors=F)
+zg=zg[zg$V2=='ES', c(1, 3, 4)]; head(zg) 
+names(zg)=c('zc', 'clat', 'clon'); str(zg)
+
+min_zc=min(as.numeric(as.character(zd_c_l$zc)))
+max_zc=max(as.numeric(as.character(zd_c_l$zc)))
+zg=zg[as.numeric(zg$zc)>=min_zc & as.numeric(zg$zc)<=max_zc, ]
+zg$zc=as.factor(zg$zc)
+zg$clat=as.numeric(gsub(",", ".", zg$clat))
+zg$clon=as.numeric(gsub(",", ".", zg$clon))
+rownames(zg)=1:nrow(zg)
+str(zg); head(zg)
+
+# Visualizing the zipcodes epicentres:
+qmap(location=c(lon=mean(d_p_$long), lat=mean(d_p_$lat)), zoom = 12, maptype = 'hybrid') + geom_point(data=zg, aes(x=clon, y=clat), colour='blue', size=3) + geom_polygon(aes(x=long, y=lat, group=group), data=d_p_, colour='red', alpha=.1, size=.3)
+```
+
+Overlaping zipcodes and tiles 
+```{r}
+zc_cent=as.matrix(cbind(zg$clon, zg$clat))
+zc_cent_s=SpatialPoints(zc_cent); proj4string(zc_cent_s)=WGS84
+zc_o=over(ps_, zc_cent_s, returnList = TRUE); zc_o; str(zc_o)
+
+# Relational table of zc and tile (belonging to): 
+zc_tid=data.frame(zc=unique(zd_c_l$zc), zc_tid=c(NA))
+for (i in 1:length(zc_o)){
+  if (length(zc_o[[i]])>0){
+    for (j in 1:length(zc_o[[i]])){
+      if (dim(zc_tid[as.character(zc_tid$zc)==as.character(zg[rownames(zg)==as.numeric(zc_o[[i]][j]), ]$zc), ])[1]>0){
+      zc_tid[as.character(zc_tid$zc)==as.character(zg[rownames(zg)==as.numeric(zc_o[[i]][j]), ]$zc), ]$zc_tid=i  
+      }}}}; 
+zc_tid=zc_tid[!is.na(zc_tid$zc_tid), ]; zc_tid
+
+write.table(zc_tid, "zc_tid.txt", sep="\t")
+```
