@@ -1,0 +1,183 @@
+---
+title: "Idealista data loading"
+author: "Blanca Alonso"
+date: "17 Mar 2015"
+output: html_document
+---
+
+```{r}
+require(maptools)
+library(fields)
+library(rgdal)
+library(ggplot2)
+library(ggmap)
+library(sp)
+library(sqldf)
+library(cluster)
+library(fpc)
+library(reshape)
+```
+
+# Loading BBVA tile information and recalculation of polygons
+
+```{r}
+td_B=read.table("td_B.txt", sep="\t"); str(td_B); head(td_B)
+t_=read.table("t_.txt", sep="\t"); str(t_); head(t_)
+
+l_=list()
+for (i in 1:dim(t_)[1]){
+  pol_lat = c(t_$lat[i], t_$lat0[i], t_$lat1[i], t_$lat2[i], t_$lat[i])
+  pol_lon = c(t_$lon[i], t_$lon0[i], t_$lon1[i], t_$lon2[i], t_$lon[i])
+  c=matrix(c(pol_lon, pol_lat), ncol=2)
+  p=list(Polygon(c))
+  ps=Polygons(p, ID=i)
+  l_=append(l_,ps)
+}; length(l_)
+
+WGS84=CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+ps_=SpatialPolygons(l_); proj4string(ps_)=WGS84
+psdf_=SpatialPolygonsDataFrame(ps_, data=data.frame(n=numeric(length(ps_))))
+d_p_=fortify(psdf_)
+```
+
+# Loading Idealista data
+
+Loading idealista data: locals
+```{r}
+files=list.files("premises", full.names=T); str(files) 
+pd=data.frame() # premises data
+for (i in 1:length(files)){ 
+  d=read.csv(files[i], sep=",", header=T, stringsAsFactors=F)
+  pd=rbind(pd, d)
+}
+pd=pd[order(pd$tid), ]; str(pd)
+pdf=pd[, c(13, 14, 33, 15, 17, 18, 21, 23, 29, 32)] # premises data features
+rownames(pdf)=1:nrow(pdf); str(pdf); head(pdf, 10) # 1080 obs.
+pdf$p_id=as.factor(1:nrow(pdf))
+
+## Calculating distance to city center
+centrelon=-2.9236; centrelat=43.2569
+pdf$distc=rdist.earth(matrix(c(pdf$longitude, pdf$latitude), ncol=2), matrix(c(centrelon, centrelat), ncol=2), miles=FALSE, R=6371); head(pdf) 
+
+## Removing outliers: industrial properties/errors
+ggplot(pdf, aes(price, size)) + geom_point()
+
+thres=30
+rem_out=function(x, na.rm = TRUE) {
+  qnt=quantile(x, probs=c(.25, .75), na.rm = na.rm)
+  H=thres * IQR(x, na.rm = na.rm)
+  y=x
+  y[x < (qnt[1] - H)]=NA
+  y[x > (qnt[2] + H)]=NA
+  y
+}
+
+#length(o[is.na(rem_out(pdf$price))]) # 2 obs.
+#length(o[is.na(rem_out(pdf$size))]) # 3 obs.
+
+pdf$o1=rem_out(pdf$price)
+pdf$o2=rem_out(pdf$size)
+pdf=pdf[!is.na(pdf$o1) & !is.na(pdf$o2), -c(13, 14)]; str(pdf) # 1076 obs.
+
+ggplot(pdf, aes(price, size)) + geom_point()
+```
+
+Visaulizing density of points:
+```{r}
+Map <- qmap("bilbao", zoom = 14, color = "bw", legend = "topleft")
+Map + stat_density2d(aes(x=longitude, y=latitude, fill = ..level..,  alpha = ..level..), size = 1, bins = 4, data = pdf, geom = "polygon")
+
+qmap("bilbao", zoom = 14) + geom_point(data=pdf, aes(x=longitude, y=latitude, color=operation), size=1) + geom_density2d(data=pdf, aes(x=longitude, y=latitude), size = 0.3) + stat_density2d(data=pdf, aes(x=longitude, y=latitude, fill=..level.., alpha=..level..), size=0.01, bins=16, geom="polygon") + scale_fill_gradient(low='blue', high ='red', guide = FALSE) + scale_alpha(range=c(0, 0.3), guide = FALSE)
+```
+
+Linear relationship between price, size and distance to the centre:
+```{r}
+str(pdf)
+lm=lm(price~size, data=pdf); summary(lm)
+lm=lm(price~distc, data=pdf); summary(lm)
+lm=lm(price~size + distc, data=pdf); summary(lm)
+```
+
+Clustering (global)
+```{r}
+cd=pdf[, c( 7, 9, 12)]; head(cd) # tid, price, size & distc
+hc=hclust(dist(cd, method="euclidean"), method="ward.D2")
+plot(hc, labels=F)
+rect.hclust(hc, k=8, border="red")
+
+groups=cutree(hc, k=8)
+plotcluster(cd, groups)
+pdf$clus=groups; head(pdf)
+
+ggplot(pdf, aes(size, distc)) + geom_point(aes(colour=factor(clus)))
+ggplot(pdf, aes(price, distc)) + geom_point(aes(colour=factor(clus)))
+ggplot(pdf, aes(size, price)) + geom_point(aes(colour=factor(clus)))
+ggplot(pdf, aes(price, size)) + geom_point()
+ggplot(pdf, aes(price, distc)) + geom_point()
+ggplot(pdf, aes(distc, size)) + geom_point()
+
+pdf$clus=groups
+bc1=aggregate(price ~ clus, data=pdf, median) 
+bc2=aggregate(price ~ clus, data=pdf, FUN=function(x) thres=quantile(x)[2])# -1.5*IQR(x)) 
+p_bc=cbind(clus=bc1$clus, price_c=bc1$price, LIQR=bc2$price); head(p_bc)
+
+op=merge(x=pdf, y=p_bc, by=('clus'), all.x=T); head(op)
+op$opp=0
+for (i in pdf){op[op$price < op$LIQR, ]$opp=1}
+opp3=op[op$opp==1,]; str(opp3) # 264 obs.
+```
+
+Rshiny: adding 'price and size ranges' variables for subset selection in the app
+```{r}
+# Rshiny
+op_0=opp3[, c(2, 3, 4, 7, 5, 6, 8, 9, 10, 11, 12)]; rownames(op_0)=1:nrow(op_0); head(op_0)
+
+op_0$p_r=NA
+for (i in 1:nrow(op_0)){
+  op_0$p_r[op_0$price<=20000]=1
+  op_0$p_r[op_0$price>20000 & op_0$price<=50000]=2
+  op_0$p_r[op_0$price>50000 & op_0$price<=100000]=3
+  op_0$p_r[op_0$price>100000 & op_0$price<=150000]=4
+  op_0$p_r[op_0$price>150000 & op_0$price<=300000]=5
+  op_0$p_r[op_0$price>300000 & op_0$price<=500000]=6
+  op_0$p_r[op_0$price>500000 & op_0$price<=1000000]=7
+  op_0$p_r[op_0$price>1000000]=8
+}
+
+op_0$s_r=NA
+for (i in 1:nrow(op_0)){
+  op_0$s_r[op_0$size<=50]=1
+  op_0$s_r[op_0$size>50 & op_0$size<=100]=2
+  op_0$s_r[op_0$size>100 & op_0$size<=200]=3
+  op_0$s_r[op_0$size>200 & op_0$size<=500]=4
+  op_0$s_r[op_0$size>500 & op_0$size<=1000]=5
+  op_0$s_r[op_0$size>1000]=6
+}
+
+op_0$type='realo'
+#names(op_0)[names(op_0)=='tid']='Tile_Id'
+#names(op_0)[names(op_0)=='p_id']='Property_Id'
+str(op_0)
+write.table(op_0, "shinyApp/opp_0.txt", sep="\t")
+
+dim(op_0[op_0$p_r==4, ])
+```
+
+Overlaping the properties points with BBVA tiles: for visualization of only the properties within a selected tile (not included in the app).
+```{r}
+p_cent=as.matrix(cbind(pdf$longitude, pdf$latitude))
+p_cent_s=SpatialPoints(p_cent); proj4string(p_cent_s)=WGS84
+p_o=over(ps_, p_cent_s, returnList = TRUE); p_o; str(p_o)
+
+# Relational table of property and tile: 
+pdf$p_tid=c(NA)
+for (i in 1:length(p_o)){
+  if (length(p_o[[i]])>0){
+    for (j in 1:length(p_o[[i]])){
+      pdf$p_tid[as.numeric(p_o[[i]][j])]=i  
+      }}}; 
+str(pdf); head(pdf) # 1080
+
+# Removing NA (from overlapping)
+pdf_t=pdf[!is.na(pdf$p_tid), ]; str(pdf_t) # 899
+```
